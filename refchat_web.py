@@ -29,6 +29,7 @@ from refchat_llm import (
     chercher_semantic_scholar,
     format_docs, expand_query, charger_llm,
     extraire_mots_cles_llm,
+    lister_themes, recuperer_articles_par_theme, detecter_theme_query,
 )
 import refchat_config as cfg
 
@@ -47,6 +48,10 @@ STATE = {
     "ingest_log":     [],
     "ingest_done":    False,
     "ingest_error":   None,
+    "theme_running": False,
+    "theme_log":     [],
+    "theme_done":    False,
+    "theme_error":   None,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -125,6 +130,63 @@ def status():
     return jsonify({"ready": STATE["ready"], "error": STATE["error"],
                     "modele": STATE["nom_llm"], "nb_extraits": count,
                     "memory_enabled": STATE["memory_enabled"]})
+
+
+@app.route("/api/themes")
+def api_themes():
+    """Retourne la liste des themes disponibles dans la base."""
+    db = STATE["db"]
+    if not db:
+        return jsonify({"themes": [], "error": "Base non initialisee"})
+    themes = lister_themes(db)
+    return jsonify({"themes": themes, "count": len(themes)})
+
+@app.route("/api/theme/start", methods=["POST"])
+def api_theme_start():
+    if STATE["theme_running"]:
+        return jsonify({"success": False, "error": "Already running"})
+    data = request.get_json() or {}
+    STATE.update({"theme_running": True, "theme_log": [],
+                  "theme_done": False, "theme_error": None})
+    n_topics = data.get("n_topics", None)
+    min_docs = data.get("min_docs", 2)
+    def run():
+        import sys as _sys, importlib, contextlib
+        try:
+            sys.path.insert(0, str(pathlib.Path(__file__).parent))
+            import refchat_theme as _rt
+            importlib.reload(_rt)
+            class Cap:
+                def write(self, msg):
+                    if msg.strip(): STATE["theme_log"].append(msg.rstrip())
+                def flush(self): pass
+                def isatty(self): return False
+            old = _sys.argv[:]
+            _sys.argv = ["refchat_theme.py", "--show"]
+            if n_topics: _sys.argv += ["--topics", str(n_topics)]
+            _sys.argv += ["--min-docs", str(min_docs)]
+            try:
+                with contextlib.redirect_stdout(Cap()): _rt.main()
+            finally:
+                _sys.argv = old
+            STATE["theme_done"] = True
+        except Exception as e:
+            STATE["theme_error"] = str(e); STATE["theme_done"] = True
+        finally:
+            STATE["theme_running"] = False
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route("/api/theme/status")
+def api_theme_status():
+    return jsonify({
+        "running": STATE["theme_running"],
+        "done":    STATE["theme_done"],
+        "error":   STATE["theme_error"],
+        "log":     STATE["theme_log"][-100:],
+    })
+
 
 
 @app.route("/api/hardware/detect")
@@ -499,6 +561,10 @@ def api_chat():
             nb_web_total    = 0  # Nombre total de résultats disponibles sur Semantic Scholar
             history_to_send = conversation_history[-(MAX_HISTORY*2):] if STATE["memory_enabled"] else []
 
+            # -- Detection de theme --
+            themes_dispo  = lister_themes(db)
+            theme_detecte = detecter_theme_query(query, themes_dispo)
+
             if mode == "auteur":
                 nom = extraire_nom_auteur(query)
                 if not nom:
@@ -609,7 +675,7 @@ def api_chat():
             tokens_in = int(chars_in / 3.5) + 150 
             tokens_out = int(len(full_response) / 3.5)
 
-            yield f"data: {json.dumps({'done': True, 'mode': mode, 'articles': articles_out, 'sources': sources_info, 'nom_llm': STATE['nom_llm'], 'elapsed': round(time.time()-t_start,1), 'history_count': len(conversation_history)//2, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'nb_web_total': nb_web_total})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'mode': mode, 'theme_detected': theme_detecte or '', 'themes_available': themes_dispo, 'articles': articles_out, 'sources': sources_info, 'nom_llm': STATE['nom_llm'], 'elapsed': round(time.time()-t_start,1), 'history_count': len(conversation_history)//2, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'nb_web_total': nb_web_total})}\n\n"
 
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -1197,6 +1263,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="stats-row"><span class="stats-label">Index</span><span class="stats-val" id="stat-index" title="">—</span></div>
     </div>
     <div>
+      <div>
+        <div class="sidebar-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+          <span>Themes</span>
+          <span id="themes-count" style="font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--text3)"></span>
+        </div>
+        <div id="themes-list" style="display:flex;flex-direction:column;gap:4px;margin-top:4px;max-height:160px;overflow-y:auto;">
+          <div style="color:var(--text3);font-size:0.75rem;font-style:italic">Loading...</div>
+        </div>
+      </div>
       <div class="sidebar-section-title">Actions</div>
       <button class="action-btn" id="btn-toggle-mem" onclick="toggleMemory()">🧠 Enable memory</button>
       <button class="action-btn" onclick="clearMemory()">🧹 Clear memory</button>
@@ -1215,6 +1290,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
       <button class="action-btn" onclick="openIngestPanel()">🔄 Index library</button>
+      <button class="action-btn" onclick="openThemePanel()" style="border-color:var(--accent2);color:var(--accent2)">🏷️ Thématisation</button>
       <button class="action-btn danger" onclick="clearChat()">🗑 Clear conversation</button>
       <button class="action-btn" onclick="settingsOpen()" style="border-color:var(--accent3);color:var(--accent3)">⚙️ Settings</button>
       <button class="action-btn danger" onclick="quitApp()" style="margin-top:8px;border-color:#f85149;color:#f85149;font-weight:600">⏻ Quit RefChat</button>
@@ -2117,6 +2193,114 @@ async function applyBlacklistAndIndex() {
 document.getElementById('check-articles-modal').addEventListener('click', e => {
   if (e.target === document.getElementById('check-articles-modal')) closeCheckArticlesModal();
 });
+
+
+function openThemePanel() {
+  const old = document.getElementById('theme-chat-panel');
+  if (old) old.remove();
+  const panel = document.createElement('div');
+  panel.id = 'theme-chat-panel';
+  panel.className = 'ingest-panel';
+  panel.innerHTML = `
+    <div class="ingest-header">
+      <div class="ingest-spinner" id="theme-spinner"></div>
+      <span class="ingest-title">🏷️ Thématisation en cours…</span>
+    </div>
+    <div style="background:rgba(63,185,80,0.08);border:1px solid var(--accent2);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:0.78rem;color:var(--text);line-height:1.5">
+      💡 <strong>What does this do?</strong><br>
+      Analyses existing embeddings to automatically group your articles into themes.
+      Duration: 2–5 min. No PDF re-reading. No Docker needed.<br><br>
+      ⚠️ <strong>Recommended workflow:</strong><br>
+      1. Run a <strong>dry-run first</strong> from the command line to check results:<br>
+      <code style="background:var(--bg1);padding:2px 6px;border-radius:4px;font-size:0.73rem">python refchat_theme.py --dry-run --topics 60 --show</code><br>
+      2. Edit <code style="background:var(--bg1);padding:2px 6px;border-radius:4px;font-size:0.73rem">refchat_stopwords.txt</code> to remove parasitic label words if needed.<br>
+      3. Only then launch here to write themes to the database.
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">
+      <label style="font-size:0.75rem;color:var(--text2);font-family:'DM Mono',monospace;white-space:nowrap">Nb thèmes :</label>
+      <input type="number" id="theme-n-topics" placeholder="auto" min="2" max="50"
+        style="width:70px;background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.8rem">
+      <span style="font-size:0.7rem;color:var(--text3)">Laisse vide = détection automatique</span>
+    </div>
+    <div class="ingest-log-box" id="theme-chat-log">Démarrage…</div>
+    <div class="ingest-progress"><div class="ingest-progress-bar" id="theme-chat-bar"></div></div>
+    <div id="theme-done-msg" style="display:none;margin-top:10px;font-size:0.82rem;color:var(--accent2)"></div>
+  `;
+  messagesEl.appendChild(panel);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  const nTopicsInput = document.getElementById('theme-n-topics');
+  const nTopics = nTopicsInput && nTopicsInput.value ? parseInt(nTopicsInput.value) : null;
+
+  fetch('/api/theme/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ n_topics: nTopics, min_docs: 2 })
+  }).then(r => r.json()).then(d => {
+    if (!d.success) {
+      const logEl = document.getElementById('theme-chat-log');
+      if (logEl) logEl.textContent = 'Erreur : ' + d.error;
+      const sp = document.getElementById('theme-spinner');
+      if (sp) sp.style.display = 'none';
+      return;
+    }
+    const poll = setInterval(async () => {
+      const s = await (await fetch('/api/theme/status')).json();
+      const logEl  = document.getElementById('theme-chat-log');
+      const barEl  = document.getElementById('theme-chat-bar');
+      const doneEl = document.getElementById('theme-done-msg');
+      const title  = panel.querySelector('.ingest-title');
+      const sp     = document.getElementById('theme-spinner');
+      if (!logEl) { clearInterval(poll); return; }
+      if (s.log && s.log.length) { logEl.textContent = s.log.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
+      if (s.done) {
+        clearInterval(poll);
+        if (sp) sp.style.display = 'none';
+        if (barEl) { barEl.style.animation = 'none'; barEl.style.width = '100%'; }
+        if (s.error) {
+          if (title) title.textContent = '❌ Erreur thématisation';
+          if (barEl) barEl.style.background = '#f85149';
+          showToast('❌ ' + s.error, true);
+        } else {
+          if (title) title.textContent = '✅ Thématisation terminée !';
+          if (barEl) barEl.style.background = 'var(--accent2)';
+          if (doneEl) { doneEl.style.display = 'block'; doneEl.innerHTML = '✅ Themes saved to database — sidebar updated.<br><span style="font-size:0.75rem;color:var(--text3)">💡 If results look off, edit <code>refchat_stopwords.txt</code> and re-run the dry-run before launching again.</span>'; }
+          showToast('✅ Thématisation terminée !');
+          await loadThemes();
+        }
+      }
+    }, 1500);
+  }).catch(e => {
+    const logEl = document.getElementById('theme-chat-log');
+    if (logEl) logEl.textContent = 'Erreur réseau : ' + e.message;
+  });
+}
+
+async function loadThemes() {
+  const listEl = document.getElementById('themes-list');
+  const countEl = document.getElementById('themes-count');
+  if (!listEl) return;
+  try {
+    const r = await fetch('/api/themes');
+    const d = await r.json();
+    if (!d.themes || d.themes.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text3);font-size:0.75rem;font-style:italic">Aucun thème — clique sur 🏷️ Thématisation</div>';
+      return;
+    }
+    countEl.textContent = d.themes.length + ' theme(s)';
+    listEl.innerHTML = d.themes.map(t => {
+      const short = t.length > 30 ? t.substring(0, 28) + '…' : t;
+      return '<button class="example-btn" style="font-size:0.72rem;padding:5px 8px;margin-bottom:3px;" onclick="setQueryTheme(' + JSON.stringify(t) + ')" title="' + t + '">🏷 ' + short + '</button>';
+    }).join('');
+  } catch(e) {
+    listEl.innerHTML = '<div style="color:var(--text3);font-size:0.72rem">Error loading themes</div>';
+  }
+}
+
+function setQueryTheme(theme) {
+  queryInput.value = 'Resume les articles du theme ' + theme;
+  queryInput.focus();
+}
 
 window.addEventListener('load', async () => {
   try {

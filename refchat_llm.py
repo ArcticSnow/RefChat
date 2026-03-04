@@ -233,14 +233,99 @@ def chercher_par_auteur(db, nom_auteur):
 
     return articles_info, chunks_selects
 
-def recuperer_articles_complets(db, query_enrichie, k_initial=8, max_articles=4, max_chunks_par_article=20):
+
+
+# ── THEMES ────────────────────────────────────────────────────────────────────
+
+def lister_themes(db):
+    try:
+        total = db._collection.count()
+        themes = set()
+        for offset in range(0, total, 2000):
+            r = db._collection.get(limit=2000, offset=offset, include=["metadatas"])
+            for meta in r["metadatas"]:
+                t = meta.get("theme", "")
+                if t:
+                    themes.add(t)
+        return sorted(themes)
+    except Exception:
+        return []
+
+
+def recuperer_articles_par_theme(db, theme, max_articles=6, max_chunks_par_article=10):
+    from langchain_core.documents import Document
+    theme_lower = theme.lower()
+    total = db._collection.count()
+    tous_docs, tous_metas = [], []
+    for offset in range(0, total, 2000):
+        r = db._collection.get(limit=2000, offset=offset, include=["documents", "metadatas"])
+        tous_docs.extend(r["documents"])
+        tous_metas.extend(r["metadatas"])
+    par_article = {}
+    for doc, meta in zip(tous_docs, tous_metas):
+        t = meta.get("theme", "")
+        if theme_lower in t.lower():
+            fname = meta.get("filename", "?")
+            if fname not in par_article:
+                par_article[fname] = []
+            par_article[fname].append((doc, meta))
+    if not par_article:
+        return [], []
+    articles_info = []
+    chunks_selects = []
+    for filename, chunks in list(par_article.items())[:max_articles]:
+        meta0 = chunks[0][1]
+        articles_info.append({
+            "filename": filename,
+            "auteur":   meta0.get("auteur", ""),
+            "annee":    meta0.get("annee", ""),
+            "titre":    meta0.get("titre", ""),
+            "nb_chunks": len(chunks),
+            "theme":    meta0.get("theme", ""),
+        })
+        chunks_tries = sorted(chunks, key=lambda x: _SECTIONS_PRIORITAIRES.get(x[1].get("section", ""), 99))
+        nb_garder = max(2, min(max_chunks_par_article, len(chunks_tries)))
+        pas = max(1, len(chunks_tries) // nb_garder)
+        selec = [chunks_tries[i] for i in range(0, len(chunks_tries), pas)][:nb_garder]
+        for doc_text, meta in selec:
+            chunks_selects.append(Document(page_content=doc_text, metadata=meta))
+    return articles_info, chunks_selects
+
+
+def detecter_theme_query(query, themes_disponibles):
+    if not themes_disponibles:
+        return None
+    import re
+    patterns = [r"th[e\xe8]me\s+\S*([^\s?!.]+)", r"cat[e\xe9]gorie\s+\S*([^\s?!.]+)"]
+    q_lower = query.lower()
+    for pat in patterns:
+        m = re.search(pat, q_lower)
+        if m:
+            candidate = m.group(1).strip()
+            for t in themes_disponibles:
+                if candidate[:10].lower() in t.lower() or t.lower()[:10] in candidate.lower():
+                    return t
+    for t in themes_disponibles:
+        first_word = t.split(" - ")[0].lower()
+        if len(first_word) > 4 and first_word in q_lower:
+            return t
+    return None
+
+def recuperer_articles_complets(db, query_enrichie, k_initial=8, max_articles=4, max_chunks_par_article=20, theme_filter=None):
     from langchain_core.documents import Document
 
-    # CORRECTION : Utilisation de k_initial pour scanner plus d'abstracts au départ
+    # Build optional theme pre-filter for ChromaDB
+    # When a theme is detected, restrict the vector search to that theme's chunks only
+    chroma_filter_abstract = {"section": "Abstract"}
+    chroma_filter_full     = None
+    if theme_filter:
+        chroma_filter_abstract = {"$and": [{"section": {"$eq": "Abstract"}}, {"theme": {"$eq": theme_filter}}]}
+        chroma_filter_full     = {"theme": {"$eq": theme_filter}}
+
     retriever_abstracts = db.as_retriever(
         search_kwargs={
-            "k": k_initial, 
-            "filter": {"section": "Abstract"} 
+            "k": k_initial,
+            "filter": chroma_filter_abstract
         }
     )
     docs_abstracts = retriever_abstracts.invoke(query_enrichie)
@@ -265,11 +350,15 @@ def recuperer_articles_complets(db, query_enrichie, k_initial=8, max_articles=4,
     if not articles_pertinents:
         return [], []
 
-    # CORRECTION : Le nombre de chunks récupérés correspond maintenant à max_articles * max_chunks_par_article
+    # Final chunk retrieval — scoped to detected theme if active
+    final_filter = {"filename": {"$in": articles_pertinents}}
+    if chroma_filter_full:
+        final_filter = {"$and": [{"filename": {"$in": articles_pertinents}}, {"theme": {"$eq": theme_filter}}]}
+
     docs_finaux = db.similarity_search(
         query_enrichie,
-        k=max_articles * max_chunks_par_article, 
-        filter={"filename": {"$in": articles_pertinents}} 
+        k=max_articles * max_chunks_par_article,
+        filter=final_filter
     )
 
     articles_info = []
