@@ -532,6 +532,29 @@ def api_quit():
     threading.Thread(target=shutdown, daemon=True).start()
     return jsonify({"ok": True})
 
+
+@app.route("/api/open-pdf", methods=["POST"])
+def api_open_pdf():
+    """Ouvre un PDF local via le serveur (contourne la restriction Firefox file://)."""
+    data = request.json or {}
+    path = data.get("path", "").strip()
+    print(f"📄 open-pdf request: '{path}'")
+    if not path or not os.path.isfile(path):
+        print(f"❌ File not found: '{path}'")
+        return jsonify({"ok": False, "error": "File not found"}), 404
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            import subprocess; subprocess.Popen(["open", path])
+        else:
+            import subprocess; subprocess.Popen(["xdg-open", path])
+        print(f"✅ Opened: '{path}'")
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"❌ Error opening: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     global conversation_history
@@ -558,83 +581,97 @@ def api_chat():
             mode            = detecter_mode(query)
             sources_info    = []
             articles_info   = []
-            nb_web_total    = 0  # Nombre total de résultats disponibles sur Semantic Scholar
+            nb_web_total    = 0
             history_to_send = conversation_history[-(MAX_HISTORY*2):] if STATE["memory_enabled"] else []
 
-            # -- Detection de theme --
-            themes_dispo  = lister_themes(db)
-            theme_detecte = detecter_theme_query(query, themes_dispo)
+            # ── Heartbeat : maintient la connexion SSE ouverte pendant le RAG ──
+            # Firefox coupe après ~30s sans données → on envoie un ping toutes les 3s
+            import threading, queue as _queue
+            _result_queue = _queue.Queue()
 
-            if mode == "auteur":
-                nom = extraire_nom_auteur(query)
-                if not nom:
-                    yield f"data: {json.dumps({'error': 'Nom auteur non détecté'})}\n\n"; return
-                articles_found, chunks = chercher_par_auteur(db, nom)
-                if not articles_found:
-                    yield f"data: {json.dumps({'error': f'No articles found for {nom}'})}\n\n"; return
-                articles_info = articles_found
-                prompt_actif  = build_prompt_with_history(PROMPT_RESUME, history_to_send)
-                docs          = chunks
-            else:
-                if mode == "resume":
-                    k_initial_val, max_articles, max_chunks_art, prompt_base = K_INITIAL, MAX_ARTICLES, MAX_CHUNKS_ARTICLE, PROMPT_RESUME
-                elif mode == "reference":
-                    k_initial_val, max_articles, max_chunks_art, prompt_base = K_INITIAL+4, MAX_ARTICLES+2, max(3, MAX_CHUNKS_ARTICLE//2), PROMPT_REFERENCE
-                else:
-                    k_initial_val, max_articles, max_chunks_art, prompt_base = K_INITIAL, MAX_ARTICLES, MAX_CHUNKS_ARTICLE, PROMPT_QUESTION
+            def _run_rag():
+                try:
+                    # -- Detection de theme --
+                    themes_dispo  = lister_themes(db)
+                    theme_detecte = detecter_theme_query(query, themes_dispo)
 
-                prompt_actif   = build_prompt_with_history(prompt_base, history_to_send)
-                query_enrichie = expand_query(query)
-                
-                # ── Mode WEB ONLY : skip Zotero, 100% Semantic Scholar ──
-                if web_search_requested == "only":
-                    query_ss = extraire_mots_cles_llm(query, llm)
-                    docs_web, nb_web_total = chercher_semantic_scholar(query_ss, limit=10)
-                    if not docs_web:
-                        yield f"data: {json.dumps({'error': 'No results on Semantic Scholar. Try broader search terms.'})}\n\n"; return
-                    docs = docs_web
-                    for d_web in docs_web:
-                        articles_info.append({
-                            "filename": "\U0001f310 WEB: " + d_web.metadata.get("titre", "Article Web"),
-                            "auteur":   d_web.metadata.get("auteur", "Inconnu"),
-                            "annee":    d_web.metadata.get("annee", "n.d."),
-                            "titre":    d_web.metadata.get("titre", ""),
-                            "nb_chunks": 1,
-                            "score":    0
-                        })
-
-                else:
-                    # ── Mode LOCAL ou HYBRIDE ──
-                    if web_search_requested and STATE["modele"] != "api":
-                        ma_eff  = max(2, max_articles // 2)
-                        mca_eff = max(3, max_chunks_art // 2)
+                    if mode == "auteur":
+                        nom = extraire_nom_auteur(query)
+                        if not nom:
+                            _result_queue.put(("error", "Nom auteur non détecté")); return
+                        articles_found, chunks = chercher_par_auteur(db, nom)
+                        if not articles_found:
+                            _result_queue.put(("error", f"No articles found for {nom}")); return
+                        _result_queue.put(("ready", {
+                            "articles_info": articles_found,
+                            "docs": chunks,
+                            "prompt_actif": build_prompt_with_history(PROMPT_RESUME, history_to_send),
+                            "themes_dispo": themes_dispo,
+                            "theme_detecte": theme_detecte,
+                            "nb_web_total": 0,
+                        }))
                     else:
-                        ma_eff  = max_articles
-                        mca_eff = max_chunks_art
+                        if mode == "resume":
+                            k_initial_val, max_articles, max_chunks_art, prompt_base = K_INITIAL, MAX_ARTICLES, MAX_CHUNKS_ARTICLE, PROMPT_RESUME
+                        elif mode == "reference":
+                            k_initial_val, max_articles, max_chunks_art, prompt_base = K_INITIAL+4, MAX_ARTICLES+2, max(3, MAX_CHUNKS_ARTICLE//2), PROMPT_REFERENCE
+                        else:
+                            k_initial_val, max_articles, max_chunks_art, prompt_base = K_INITIAL, MAX_ARTICLES, MAX_CHUNKS_ARTICLE, PROMPT_QUESTION
 
-                    articles_info, docs = recuperer_articles_complets(
-                        db, query_enrichie, k_initial=k_initial_val,
-                        max_articles=ma_eff, max_chunks_par_article=mca_eff,
-                    )
+                        prompt_actif   = build_prompt_with_history(prompt_base, history_to_send)
+                        query_enrichie = expand_query(query)
 
-                    # ── Mode HYBRIDE : ajouter résultats web ──
-                    if web_search_requested:
-                        query_ss = extraire_mots_cles_llm(query, llm)
-                        docs_web, nb_web_total = chercher_semantic_scholar(query_ss)
-                        if docs_web:
-                            docs.extend(docs_web)
-                            for d_web in docs_web:
-                                articles_info.append({
-                                    "filename": "\U0001f310 WEB: " + d_web.metadata.get("titre", "Article Web"),
-                                    "auteur":   d_web.metadata.get("auteur", "Inconnu"),
-                                    "annee":    d_web.metadata.get("annee", "n.d."),
-                                    "titre":    d_web.metadata.get("titre", ""),
-                                    "nb_chunks": 1,
-                                    "score":    0
-                                })
+                        if web_search_requested == "only":
+                            query_ss = extraire_mots_cles_llm(query, llm)
+                            docs_web, nb_web_total_local = chercher_semantic_scholar(query_ss, limit=10)
+                            if not docs_web:
+                                _result_queue.put(("error", "No results on Semantic Scholar.")); return
+                            docs = docs_web
+                            ai_local = [{"filename": "🌐 WEB: "+d.metadata.get("titre",""), "auteur": d.metadata.get("auteur","Inconnu"), "annee": d.metadata.get("annee","n.d."), "titre": d.metadata.get("titre",""), "nb_chunks": 1, "score": 0} for d in docs_web]
+                        else:
+                            ma_eff  = max(2, max_articles // 2) if (web_search_requested and STATE["modele"] != "api") else max_articles
+                            mca_eff = max(3, max_chunks_art // 2) if (web_search_requested and STATE["modele"] != "api") else max_chunks_art
+                            ai_local, docs = recuperer_articles_complets(db, query_enrichie, k_initial=k_initial_val, max_articles=ma_eff, max_chunks_par_article=mca_eff)
+                            nb_web_total_local = 0
+                            if web_search_requested:
+                                query_ss = extraire_mots_cles_llm(query, llm)
+                                docs_web, nb_web_total_local = chercher_semantic_scholar(query_ss)
+                                if docs_web:
+                                    docs.extend(docs_web)
+                                    ai_local += [{"filename": "🌐 WEB: "+d.metadata.get("titre",""), "auteur": d.metadata.get("auteur","Inconnu"), "annee": d.metadata.get("annee","n.d."), "titre": d.metadata.get("titre",""), "nb_chunks": 1, "score": 0} for d in docs_web]
+                            if not docs:
+                                _result_queue.put(("error", "No excerpts found.")); return
 
-                    if not docs:
-                        yield f"data: {json.dumps({'error': 'No excerpts found. Try different terms or enable web search.'})}\n\n"; return
+                        _result_queue.put(("ready", {
+                            "articles_info": ai_local,
+                            "docs": docs,
+                            "prompt_actif": prompt_actif,
+                            "themes_dispo": themes_dispo,
+                            "theme_detecte": theme_detecte,
+                            "nb_web_total": nb_web_total_local,
+                        }))
+                except Exception as e:
+                    _result_queue.put(("error", str(e)))
+
+            # Lancer le RAG en arrière-plan
+            rag_thread = threading.Thread(target=_run_rag, daemon=True)
+            rag_thread.start()
+
+            # Envoyer des heartbeats pendant que le RAG tourne
+            while _result_queue.empty():
+                yield ": keepalive\n\n"
+                rag_thread.join(timeout=3)
+
+            status, payload = _result_queue.get()
+            if status == "error":
+                yield f"data: {json.dumps({'error': payload})}\n\n"; return
+
+            articles_info  = payload["articles_info"]
+            docs           = payload["docs"]
+            prompt_actif   = payload["prompt_actif"]
+            themes_dispo   = payload["themes_dispo"]
+            theme_detecte  = payload["theme_detecte"]
+            nb_web_total   = payload["nb_web_total"]
 
             contexte  = format_docs(docs)
             rag_chain = (
@@ -661,9 +698,24 @@ def api_chat():
                 key = (m.get("auteur","?"), m.get("annee","?"))
                 if key not in seen:
                     seen.add(key)
-                    sources_info.append({"auteur": m.get("auteur","?"), "annee": m.get("annee","?"),
-                                         "titre": m.get("titre", m.get("source","?")), "section": m.get("section","?"),
-                                         "url": m.get("source", "")})
+                    pdf_path = m.get("source", "")
+                    # Construire un lien file:// pour ouvrir le PDF directement dans Firefox
+                    file_link = ""
+                    if pdf_path and not pdf_path.startswith("http") and os.path.isfile(pdf_path):
+                        import urllib.parse
+                        normalized = pdf_path.replace("\\", "/")
+                        if not normalized.startswith("/"):
+                            normalized = "/" + normalized
+                        file_link = "file://" + urllib.parse.quote(normalized, safe=":/")
+                    sources_info.append({
+                        "auteur":     m.get("auteur","?"),
+                        "annee":      m.get("annee","?"),
+                        "titre":      m.get("titre", m.get("source","?")),
+                        "section":    m.get("section","?"),
+                        "url":        pdf_path,
+                        "doi":        m.get("doi", ""),
+                        "zotero_link": file_link,
+                    })
 
             articles_out = [{"auteur": a.get("auteur","?"), "annee": a.get("annee","?"),
                              "titre": (a.get("titre") or a.get("filename","?"))[:80],
@@ -765,8 +817,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .sources-title { font-size:0.72rem; color:var(--text3); margin-bottom:6px; font-family:'DM Mono',monospace; text-transform:uppercase; }
   .source-tag { display:inline-block; margin:2px; background:var(--bg3); border:1px solid var(--border); color:var(--text2); font-size:0.72rem; padding:2px 8px; border-radius:4px; font-family:'DM Mono',monospace; }
   
-  .elapsed-time { margin-top:8px; font-size:0.7rem; color:var(--text3); font-family:'DM Mono',monospace; text-align:right; border-top:1px solid var(--border); padding-top:6px; display:flex; justify-content:flex-end; align-items:center; gap:10px; }
+  .elapsed-time { margin-top:8px; font-size:0.7rem; color:var(--text3); font-family:'DM Mono',monospace; border-top:1px solid var(--border); padding-top:6px; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .elapsed-right { display:flex; align-items:center; gap:10px; }
   .tokens-badge { display:inline-block; padding:2px 6px; background:#1c2842; border:1px solid #1f6feb44; border-radius:4px; font-size:0.65rem; color:#58a6ff; font-family:'DM Mono',monospace; }
+  .bubble-actions { display:flex; gap:6px; align-items:center; }
+  .btn-copy, .btn-export { display:inline-flex; align-items:center; gap:4px; background:var(--bg3); border:1px solid var(--border); color:var(--text3); font-size:0.68rem; padding:3px 9px; border-radius:6px; cursor:pointer; font-family:'DM Mono',monospace; transition:all 0.2s; white-space:nowrap; }
+  .btn-copy:hover { border-color:var(--accent); color:var(--accent); }
+  .btn-export:hover { border-color:var(--accent2); color:var(--accent2); }
+  .btn-copy.copied { border-color:var(--accent2); color:var(--accent2); }
+  .source-tag.zotero-link { cursor:pointer; text-decoration:none; transition:all 0.2s; }
+  .source-tag.zotero-link:hover { border-color:#e06c3388; color:#e06c33; background:#2a1a0a; }
   
   .articles-info { margin-top:8px; padding:8px 12px; background:var(--bg3); border-radius:8px; border:1px solid var(--border); }
   .articles-info-title { font-size:0.7rem; color:var(--text3); margin-bottom:4px; font-family:'DM Mono',monospace; text-transform:uppercase; }
@@ -1878,13 +1938,16 @@ async function sendQuery() {
         if (payload.token) {
           if (!bubbleReady) { thinkingEl.remove(); messagesEl.appendChild(botDiv); bubbleReady=true; }
           fullText+=payload.token;
-          bubble.innerHTML=marked.parse(fullText);
+          // ── OPTIMISATION RAM : texte brut pendant le stream, Markdown rendu UNE SEULE FOIS à la fin ──
+          bubble.textContent=fullText;
           messagesEl.scrollTop=messagesEl.scrollHeight;
         }
         if (payload.done) {
           const meta=payload;
           const modeMap={question:'💬 Question',resume:'📋 Summary',reference:'🔎 References',auteur:'👤 Author'};
           let html=`<div class="mode-badge mode-${meta.mode||'question'}">${modeMap[meta.mode]||'💬 Question'}</div>`+marked.parse(fullText);
+
+          // ── Articles analysés ──
           if (meta.articles&&meta.articles.length) {
             html+=`<div class="articles-info"><div class="articles-info-title">📂 ${meta.articles.length} article(s) analyzed</div>`;
             for (const a of meta.articles) {
@@ -1896,39 +1959,68 @@ async function sendQuery() {
             }
             html+=`</div>`;
           }
+
+          // ── Bouton Copy — entre le texte et les sources ──
+          // Le texte est stocké via un id unique sur la bulle, pas en data-text (évite les bugs de backticks)
+          const bubbleId = 'bubble-' + Date.now();
+          bubble.id = bubbleId;
+          html+=`<div style="margin:10px 0 4px 0;">
+                   <button class="btn-copy" onclick="copyBubbleById('${bubbleId}')">📋 Copy text</button>
+                 </div>`;
+
+          // ── Sources citées avec liens Zotero / DOI ──
           if (meta.sources&&meta.sources.length) {
-            html+=`<div class="sources"><div class="sources-title">Cited sources</div>`;
+            html+=`<div class="sources"><div class="sources-title">📎 Cited sources</div>`;
             for (const s of meta.sources) {
               if (s.section === 'Web Search') {
-                // Priorité : URL directe (DOI) → sinon Google Scholar
+                // Source web → DOI ou Google Scholar
                 const href = s.url && s.url.startsWith('http')
                   ? s.url
                   : 'https://scholar.google.com/scholar?q=' + encodeURIComponent((s.titre||'') + ' ' + s.auteur + ' ' + s.annee);
                 const isDoi = s.url && s.url.includes('doi.org');
-                const tooltip = isDoi ? 'Open via DOI' : 'Search on Google Scholar';
-                html+=`<a href="${href}" target="_blank" rel="noopener" title="${tooltip}"
+                html+=`<a href="${escHtml(href)}" target="_blank" rel="noopener"
+                          title="${isDoi ? 'Open via DOI' : 'Search on Google Scholar'}"
                           class="source-tag" style="color:var(--accent);text-decoration:none;border-color:#58a6ff44;">
-                          &#127758; ${escHtml(s.auteur)}, ${escHtml(s.annee)}
+                          🌐 ${escHtml(s.auteur)}, ${escHtml(s.annee)}
                           <span style="font-size:0.65rem;opacity:0.7;margin-left:3px">${isDoi ? '🔗 DOI' : '🔍'}</span>
                         </a>`;
+              } else if (s.zotero_link) {
+                // Source locale → ouvre via /api/open-pdf côté serveur
+                const doiLink = s.doi
+                  ? ` <a href="https://doi.org/${escHtml(s.doi)}" target="_blank" rel="noopener"
+                         title="Open DOI" style="color:var(--accent);font-size:0.65rem;margin-left:4px;text-decoration:none;">🔗</a>`
+                  : '';
+                // Encodage base64 du chemin pour éviter tout conflit de guillemets dans onclick
+                const b64Path = btoa(unescape(encodeURIComponent(s.url || '')));
+                html+=`<span class="source-tag zotero-link" title="Open PDF"
+                          onclick="openLocalPdf(atob('${b64Path}'))" style="cursor:pointer;">
+                          📄 ${escHtml(s.auteur)}, ${escHtml(s.annee)}
+                          <span style="font-size:0.62rem;opacity:0.6;margin-left:3px">↗ PDF</span>
+                        </span>${doiLink}`;
               } else {
-                html+=`<span class="source-tag">${escHtml(s.auteur)}, ${escHtml(s.annee)}</span>`;
+                // Fallback : tag simple sans lien
+                html+=`<span class="source-tag">📄 ${escHtml(s.auteur)}, ${escHtml(s.annee)}</span>`;
               }
             }
             html+=`</div>`;
           }
-          
+
+          // ── Barre inférieure : stats uniquement ──
           if (meta.elapsed!==undefined) {
             const webInfo = meta.nb_web_total > 0
               ? ` <span style="color:var(--accent2);font-size:0.65rem;margin-left:6px">🌐 ${meta.nb_web_total.toLocaleString()} results on Semantic Scholar</span>`
               : '';
             html+=`<div class="elapsed-time">
-                     <span>⏱️ ${meta.elapsed}s — ${escHtml(meta.nom_llm||'')}${webInfo}</span>
-                     <span class="tokens-badge">📥 ~${meta.tokens_in} tokens sent | 📤 ~${meta.tokens_out} tokens received</span>
+                     <div class="elapsed-right">
+                       <span>⏱️ ${meta.elapsed}s — ${escHtml(meta.nom_llm||'')}${webInfo}</span>
+                       <span class="tokens-badge">📥 ~${meta.tokens_in} tok | 📤 ~${meta.tokens_out} tok</span>
+                     </div>
                    </div>`;
           }
-          
+
           bubble.innerHTML=html;
+          // Stocker le texte brut proprement sur l'élément DOM (pas en attribut HTML)
+          bubble._rawText = fullText;
           if (memoryEnabled) updateMemoryBadge(meta.history_count||0);
           messagesEl.scrollTop=messagesEl.scrollHeight;
         }
@@ -1936,6 +2028,7 @@ async function sendQuery() {
     }
   } catch(e) {
     if (bubbleReady) bubble.innerHTML=marked.parse(fullText)+`<div class="elapsed-time" style="color:#f85149">⏹ Stopped</div>`;
+    // Rendu Markdown final même si stream interrompu
     else { thinkingEl.remove(); if (e.name!=='AbortError') appendMessage('bot',null,null,'Network error: '+e.message); else appendMessage('bot',null,null,'⏹ Generation stopped.'); }
   }
   isLoading=false; currentAbortController=null; setStopMode(false); queryInput.focus();
@@ -1945,6 +2038,27 @@ queryInput.addEventListener('input',()=>{ queryInput.style.height='auto'; queryI
 queryInput.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendQuery();} });
 btnSend.addEventListener('click',()=>{ if(isLoading) stopQuery(); else sendQuery(); });
 btnInit.addEventListener('click',initSystem);
+
+// ── Ouvrir un PDF local via le serveur Flask (contourne restriction Firefox) ──
+function openLocalPdf(path) {
+  fetch('/api/open-pdf', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: path})
+  }).catch(e => console.warn('open-pdf error:', e));
+}
+function copyBubbleById(bubbleId) {
+  const bubble = document.getElementById(bubbleId);
+  const text = bubble && bubble._rawText ? bubble._rawText : '';
+  const btn = bubble && bubble.querySelector('.btn-copy');
+  navigator.clipboard.writeText(text).then(() => {
+    if (btn) { btn.textContent='✅ Copied!'; btn.classList.add('copied'); setTimeout(()=>{ btn.textContent='📋 Copy text'; btn.classList.remove('copied'); },2000); }
+  }).catch(() => {
+    const ta=document.createElement('textarea'); ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    if (btn) { btn.textContent='✅ Copied!'; btn.classList.add('copied'); setTimeout(()=>{ btn.textContent='📋 Copy text'; btn.classList.remove('copied'); },2000); }
+  });
+}
 
 async function initSystem() {
   const modele=modelSelect.value;
